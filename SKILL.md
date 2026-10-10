@@ -41,7 +41,9 @@ Write into a scratch directory (e.g. `./.yt/<id>`), and **delete it once you hav
 ## Summarising rules
 
 - **Lead with the metadata**: title, channel, length, upload date, views. The user cannot see the video from your message.
-- **Attribute claims to the speaker.** A transcript is one person talking. Write "he argues", "she claims" — never restate contested opinion as established fact.
+- **Attribute claims to the speaker.** A transcript is one person talking. Write "he argues", "she claims" — never restate what the speaker says as established fact. Attribution is neutral: it marks whose view it is and stops there.
+- **Report; do not adjudicate.** Your job is what the video says, not whether it is right. Do not evaluate the speaker's evidence, sample, rhetoric, motives, or expertise, and do not rebut, "balance" or caveat their claims — no verdict sections ("How to read it", "Assessment", "Caveats"), no noting what they left out, no stating what the science "really" says. This holds for opinions you find objectionable and for ones you agree with; both are simply reported as the speaker's position. The user can judge the content themselves.
+- **Judge the artifact, never the speaker.** Comment on caption reliability when it affects the words — a track is auto-generated so wording is approximate, or a name is visibly garbled — because that is about the transcript you produced, not about the person in it. Keep the two clearly separate.
 - **Structure by the speaker's own argument**, not by chronology. A gist that walks through the video minute by minute is not a gist.
 - **Prefer the original language.** Read the original-language transcript yourself rather than using `--text-lang`; YouTube's auto-translation mangles names, political vocabulary, and idioms badly. Summarise in the user's language.
 
