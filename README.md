@@ -5,14 +5,17 @@ machine-formatted captions into readable text, then summarise it honestly.
 
 The hard part isn't downloading captions — it's that YouTube returns them as `json3`/`vtt` with
 rolling duplication and no sentence structure, that caption tracks throttle individually with
-HTTP 429, and that it's easy to summarise the wrong track without noticing. This skill handles
-those failure modes explicitly and tells you when it has substituted something.
+HTTP 429 (sometimes for a whole video at once), and that it's easy to summarise the wrong track
+without noticing. This skill handles those failure modes explicitly and tells you when it has
+substituted something.
 
 ## Contents
 
 - `SKILL.md` — the skill definition and instructions for the agent.
 - `scripts/fetch_transcript.py` — the fetcher/parser. `yt-dlp` is the only reliable route to
   caption tracks; there is no working API substitute without a key.
+- `scripts/test_fetch_transcript.py` — offline regression tests for the retry budget, the
+  subprocess timeout, and track provenance. `python3 -m unittest discover -s scripts`.
 
 ## Requirements
 
@@ -41,15 +44,34 @@ python3 scripts/fetch_transcript.py "<url>" --outdir ./.yt/<id>
 
 With no `--lang`, the script picks the track itself — human-written tracks first, then the
 automatic track in the original audio language — and falls back through a short candidate list
-if the first one is throttled, warning on stderr whenever it substitutes. Check
-`caption_language` in `meta.txt` before writing anything that depends on which track you got.
+if the first one is throttled, warning on stderr whenever it substitutes. Check `caption_language`
+and `caption_note` in `meta.txt` before writing anything that depends on which track you got.
+
+## Retries, timeouts, and provenance
+
+Captions are throttled hard, so the fetcher is built to fail quickly rather than hang or grind:
+
+- **Sweep before backoff.** Every candidate track is tried once with no wait before any track is
+  retried. Measured behaviour on a throttled video: its `en` track returned 429 across five fresh
+  signatures over four minutes, while its `ar-orig` track answered in the same second. Switching
+  tracks works; retrying a dead one does not. The retry pass is capped to the leading candidates,
+  so a fully blocked video stays near a dozen requests instead of becoming a request storm.
+- **Two hard bounds.** Each `yt-dlp` call runs with `--socket-timeout 15` and a `SUBPROCESS_TIMEOUT_S`
+  timeout, and each phase runs against a `PHASE_BUDGET_S` wall-clock budget. A blocked video fails
+  in roughly 90 seconds with a real exit code instead of hanging with no output.
+- **Honest provenance.** YouTube marks a machine translation with a `tlang` parameter, which the
+  language code alone cannot reveal: a track keyed `en` on a video whose only ASR source is Arabic
+  is published as `lang=ar&tlang=en`. The fetcher reads that parameter, so a translation is never
+  reported as the original wording, and a track that transcribes YouTube's auto-dubbed audio is
+  labelled as such in `caption_note`.
 
 ## Outputs
 
 - `transcript.txt` — `[m:ss] text`, one line per caption block. The file to read.
 - `transcript.flat.txt` — single line, for word counts and grep.
-- `meta.txt` — id, title, channel, duration, upload date, views, likes, original language, and
-  which caption track was used. Written even when the caption download fails.
+- `meta.txt` — id, title, channel, duration, upload date, views, likes, original language, which
+  caption track was used, and `caption_note` when that track is a translation or a dub's source.
+  Written even when the caption download fails.
 
 ## Exit codes
 
@@ -58,7 +80,7 @@ if the first one is throttled, warning on stderr whenever it substitutes. Check
 | 0 | Fine | Read `transcript.txt` |
 | 2 | URL or tooling is broken (private, removed, no `yt-dlp`) | Do not retry; report the failure |
 | 3 | The video genuinely has no caption track | Say so; never summarise from the title |
-| 4 | Captions exist but every candidate track was throttled | Wait ~60s, retry once; `--list-langs` then a specific `--lang` often works |
+| 4 | Captions exist but no candidate track downloaded | Check whether the block is per-video (a control video succeeds) or per-IP, then `--list-langs` and a specific `--lang`; a `<lang>-orig` key often works |
 
 ## Installing as an agent skill
 

@@ -22,6 +22,10 @@ Exit codes:
 
 On exit 4 the metadata is still written to <outdir>/meta.txt, so a throttled run
 yields the title/channel/date rather than nothing at all.
+
+Every yt-dlp call has a hard timeout and the caption phase runs against a wall-clock
+budget, so a throttled or stalled video fails in about 90 seconds instead of hanging
+indefinitely.
 """
 
 from __future__ import annotations
@@ -36,12 +40,37 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 # YouTube rate-limits caption downloads hard (HTTP 429), especially when several
-# yt-dlp calls run close together. Backoff is deliberately generous.
+# yt-dlp calls run close together. Backoff is deliberately generous, but every wait
+# is also bounded by a phase budget so a dead track cannot stall the whole run.
 RETRY_ATTEMPTS = 5
 RETRY_BACKOFF_S = 8.0
 RETRY_BACKOFF_CAP_S = 45.0
+
+# Hard ceiling on a single yt-dlp invocation, and on the whole run. Without the
+# first, a stalled socket blocks forever: no exit code is produced and the caller just
+# hangs. Without the second, a throttled video grinds through every candidate and
+# every backoff far past the point of usefulness. A 43-minute video's caption track
+# downloads in ~3s and its metadata in ~2s, so both ceilings are generous.
+#
+# A single run is bounded by PHASE_BUDGET_S plus whatever is left of it, because each
+# call is given min(SUBPROCESS_TIMEOUT_S, budget remaining) rather than a fresh
+# timeout — so the two do not stack.
+SUBPROCESS_TIMEOUT_S = 60.0
+PHASE_BUDGET_S = 75.0
+
+# The biggest lever on a throttled video is *switching* tracks, so the default path
+# sweeps `<lang>-orig` keys when the audio language has no usable track of its own.
+# Capped: each candidate costs a subprocess, and a long tail of them is what invites
+# the 429 in the first place.
+MAX_ORIG_FALLBACKS = 6
+
+# After the no-backoff sweep, only the leading candidates are worth retrying. If the
+# whole list failed, the block is per-video or per-IP and hammering the tail helps
+# nobody; this keeps the worst case near a dozen requests rather than dozens.
+MAX_RETRY_PASS_CANDIDATES = 3
 
 
 def die(message: str, code: int) -> None:
@@ -50,10 +79,43 @@ def die(message: str, code: int) -> None:
     sys.exit(code)
 
 
-def backoff(attempt: int) -> None:
-    """Sleep with exponential backoff plus jitter to escape 429 throttling."""
-    delay = min(RETRY_BACKOFF_S * (2 ** (attempt - 1)), RETRY_BACKOFF_CAP_S)
-    time.sleep(delay + random.uniform(0, 3.0))
+def backoff_delay(attempt: int) -> float:
+    """Seconds to wait before the next attempt: exponential, capped, jittered."""
+    return min(RETRY_BACKOFF_S * (2 ** (attempt - 1)), RETRY_BACKOFF_CAP_S) + random.uniform(
+        0, 3.0
+    )
+
+
+def sleep_within_budget(delay: float, deadline: float) -> bool:
+    """Sleep `delay` seconds unless that would overrun `deadline`.
+
+    Returns False when the wait was skipped, which tells the caller to stop rather
+    than keep paying for a track that is not answering. The check is against the
+    clock, so a long tail of retries cannot add up past the phase budget.
+    """
+    if time.monotonic() + delay > deadline:
+        return False
+    time.sleep(delay)
+    return True
+
+
+def remaining_budget(deadline: float) -> float:
+    """Seconds left before `deadline`, never below 1s, to bound a single call."""
+    return max(1.0, deadline - time.monotonic())
+
+
+def run_yt_dlp(cmd: list[str], timeout: float = SUBPROCESS_TIMEOUT_S) -> tuple[int, str, str]:
+    """Run yt-dlp under a hard timeout, returning (returncode, stdout, stderr).
+
+    A timeout comes back as returncode -1 with an explanatory stderr rather than an
+    exception, so every caller treats it as one more transient failure. Without a
+    timeout here a stalled connection hangs the script forever instead of failing.
+    """
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return -1, "", f"yt-dlp exceeded {timeout:.0f}s without finishing and was killed"
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
 # Retrying these wastes minutes: they do not resolve on their own, and the
@@ -79,27 +141,32 @@ def is_permanent_error(text: str) -> bool:
     return any(marker in lowered for marker in PERMANENT_ERRORS)
 
 
-def yt_dlp_json(url: str) -> dict:
+def yt_dlp_json(url: str, attempts: int = RETRY_ATTEMPTS, deadline: float | None = None) -> dict:
     """Return yt-dlp's single-video metadata JSON, retrying on transient 429s."""
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--skip-download",
         "--no-warnings",
+        "--socket-timeout",
+        "15",
         "--dump-single-json",
         url,
     ]
+    if deadline is None:
+        deadline = time.monotonic() + PHASE_BUDGET_S
     last = ""
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode == 0 and proc.stdout.strip():
-            return json.loads(proc.stdout)
-        last = (proc.stderr or proc.stdout).strip()
+    for attempt in range(1, attempts + 1):
+        code, out, err = run_yt_dlp(cmd, timeout=min(SUBPROCESS_TIMEOUT_S, remaining_budget(deadline)))
+        if code == 0 and out.strip():
+            return json.loads(out)
+        last = (err or out).strip()
         if is_permanent_error(last):
             die(f"yt-dlp cannot read this URL (not retryable):\n{last}", 2)
-        if attempt < RETRY_ATTEMPTS:
-            backoff(attempt)
-    die(f"yt-dlp could not read this URL after {RETRY_ATTEMPTS} attempts:\n{last}", 2)
+        if attempt < attempts and not sleep_within_budget(backoff_delay(attempt), deadline):
+            last += "\nstopped retrying: run budget exhausted"
+            break
+    die(f"yt-dlp could not read this URL after {attempts} attempts:\n{last}", 2)
 
 
 def fmt_duration(seconds: int | float | None) -> str:
@@ -170,6 +237,57 @@ def original_keys(orig: str) -> list[str]:
     return [orig, f"{base}-orig", base]
 
 
+def track_url_params(meta: dict, lang: str, is_auto: bool) -> dict[str, str]:
+    """Query parameters of the caption URL YouTube published for one track."""
+    pool = (meta.get("automatic_captions") if is_auto else meta.get("subtitles")) or {}
+    for entry in pool.get(lang) or []:
+        url = entry.get("url") or ""
+        if "?" in url:
+            return {k: v[0] for k, v in parse_qs(urlparse(url).query).items() if v}
+    return {}
+
+
+def translation_source(meta: dict, lang: str, is_auto: bool) -> str | None:
+    """The language a track is machine-translated *from*, or None if it is not one.
+
+    YouTube marks a translation with a `tlang` parameter, and that is the only
+    reliable signal. A track requested as `en` on a video whose only ASR source is
+    Arabic is published as `lang=ar&tlang=en`. Language codes alone cannot see this:
+    `en` against an audio language of `en-US` looks exactly like the original
+    wording, which is how YouTube's Arabic-to-English round-trip came to be reported
+    as the original wording.
+    """
+    params = track_url_params(meta, lang, is_auto)
+    source, target = params.get("lang"), params.get("tlang")
+    if source and target and not same_language(source, target):
+        return source
+    return None
+
+
+def caption_provenance(meta: dict, lang: str, is_auto: bool, orig: str | None) -> str | None:
+    """One honest line about what the chosen track actually is, or None if plain.
+
+    Three ways a track can be something other than the video's own wording:
+
+    * a machine translation, which only the `tlang` URL parameter reveals;
+    * the source track of an auto-dub (`<lang>-orig`) whose language is not the
+      video's audio language — genuine ASR, but of the dubbed audio;
+    * simply a different language from the audio.
+    """
+    source = translation_source(meta, lang, is_auto)
+    if source:
+        return f"machine-translated from {source!r} by YouTube, not the original wording"
+    if not is_original_track(lang, orig):
+        return f"not the video's original audio language ({orig!r})"
+    base = base_language(lang)
+    if orig and not same_language(base, orig):
+        return (
+            f"transcribes YouTube's auto-dubbed {base!r} audio, "
+            f"not the video's original {orig!r} audio"
+        )
+    return None
+
+
 def track_candidates(meta: dict, wanted: str | None) -> list[tuple[str, bool]]:
     """Caption tracks to try, best first, as (language_code, is_automatic).
 
@@ -190,6 +308,14 @@ def track_candidates(meta: dict, wanted: str | None) -> list[tuple[str, bool]]:
     automatic tracks, since '-orig' names the source rather than a variant. A track
     in a *different* language is only ever appended for an explicit request that is
     itself a translation, so asking for 'de' never quietly returns English.
+
+    One more case, and the reason for the sweep at the end of the default path: when
+    YouTube has auto-dubbed a video, the audio language can have no published track of
+    its own. The original-language caption may then be a *translation of the dub*
+    (`lang=ar&tlang=en` behind an `en` key), while the only genuine ASR lives under
+    another language's `<lang>-orig`. Those are appended as a last resort so the run
+    still yields the video's content, with meta.txt recording what was really used.
+    An explicit --lang stays strict, so asking for 'de' never returns Arabic.
     """
     manual = meta.get("subtitles") or {}
     auto = meta.get("automatic_captions") or {}
@@ -243,6 +369,19 @@ def track_candidates(meta: dict, wanted: str | None) -> list[tuple[str, bool]]:
         for lang in ordered:
             if lang in pool and (lang, is_auto) not in candidates:
                 candidates.append((lang, is_auto))
+
+    # Last resort on the default path: the ASR source tracks, whatever language they
+    # are in. On an auto-dubbed video these are the only real transcripts YouTube
+    # publishes. Capped and appended last, so a language-matched track always wins.
+    fallbacks = 0
+    for pool, is_auto in pools:
+        for lang in sorted(pool):
+            if fallbacks >= MAX_ORIG_FALLBACKS:
+                break
+            if lang.endswith("-orig") and (lang, is_auto) not in candidates:
+                candidates.append((lang, is_auto))
+                fallbacks += 1
+
     if candidates:
         return candidates
     for pool, is_auto in pools:
@@ -252,7 +391,11 @@ def track_candidates(meta: dict, wanted: str | None) -> list[tuple[str, bool]]:
 
 
 def download_captions(
-    url: str, lang: str, dest_dir: Path, attempts: int = RETRY_ATTEMPTS
+    url: str,
+    lang: str,
+    dest_dir: Path,
+    attempts: int = RETRY_ATTEMPTS,
+    deadline: float | None = None,
 ) -> tuple[Path | None, str]:
     """Try to download one caption track.
 
@@ -261,7 +404,12 @@ def download_captions(
     auto track and translated ones in particular) while serving a sibling fine in the
     same minute. `attempts` is lowered by the caller when further candidates exist, so
     a throttled track does not burn minutes of backoff before a working one is tried.
+
+    Every retry wait is checked against `deadline` (defaulting to a fresh phase
+    budget), so this cannot add up past it however many attempts are requested.
     """
+    if deadline is None:
+        deadline = time.monotonic() + PHASE_BUDGET_S
     dest_dir.mkdir(parents=True, exist_ok=True)
     template = str(dest_dir / "cap.%(ext)s")
     base = [
@@ -269,6 +417,8 @@ def download_captions(
         "--no-playlist",
         "--skip-download",
         "--no-warnings",
+        "--socket-timeout",
+        "15",
         "--sleep-subtitles",
         "2",
         "--sub-langs",
@@ -287,17 +437,23 @@ def download_captions(
     ]
     last = ""
     for attempt in range(1, attempts + 1):
-        proc = subprocess.run(base, capture_output=True, text=True)
+        code, out, err = run_yt_dlp(base, timeout=min(SUBPROCESS_TIMEOUT_S, remaining_budget(deadline)))
         produced = sorted(dest_dir.glob("cap*"))
         if produced:
             return produced[0], ""
-        last = (proc.stderr or proc.stdout).strip()
+        last = (err or out).strip()
         for stale in dest_dir.glob("cap*"):
             stale.unlink()  # a partial/zero-byte track must not satisfy the next check
         if is_permanent_error(last):
             return None, last
-        if attempt < RETRY_ATTEMPTS:
-            backoff(attempt)
+        # Compare against `attempts`, NOT the module constant: the old code tested
+        # `attempt < RETRY_ATTEMPTS`, so a track whose budget had already been
+        # lowered to 3 attempts still slept backoff(3) = 32s *after* its final
+        # failure — pure dead time on a track that was never going to answer.
+        if attempt < attempts:
+            if not sleep_within_budget(backoff_delay(attempt), deadline):
+                last += "\nstopped retrying: caption budget exhausted"
+                break
     return None, last
 
 
@@ -387,7 +543,11 @@ def main() -> int:
     if not shutil.which("yt-dlp"):
         die("yt-dlp is not on PATH; install it or use the web_fetch fallback described in SKILL.md", 2)
 
-    meta = yt_dlp_json(args.url)
+    # One deadline for the whole run, shared by the metadata fetch and the caption
+    # loop, so the two budgets cannot stack into a multi-minute worst case.
+    deadline = time.monotonic() + PHASE_BUDGET_S
+
+    meta = yt_dlp_json(args.url, deadline=deadline)
     vid = meta.get("id", "unknown")
     manual = sorted((meta.get("subtitles") or {}).keys())
     auto = sorted((meta.get("automatic_captions") or {}).keys())
@@ -417,53 +577,80 @@ def main() -> int:
 
     orig = meta.get("language")
     candidates = track_candidates(meta, args.text_lang or args.lang)
-    # Fewer per-track retries when there are fallbacks to try: spending three minutes
-    # of backoff on a throttled 'en' before reaching the 'en-orig' that answers at
-    # once is worse than moving straight on to it.
-    attempts = RETRY_ATTEMPTS if len(candidates) == 1 else 3
+    # Fewer per-track retries when there are fallbacks to try: spending minutes of
+    # backoff on a throttled 'en' before reaching the 'en-orig' that answers at once
+    # is worse than moving straight on to it.
+    retry_attempts = RETRY_ATTEMPTS if len(candidates) == 1 else 3
 
     outdir = Path(args.outdir) if args.outdir else Path(f"yt-transcript-{vid}")
     # Download and parse inside ONE process run. In this harness /tmp is a private
     # namespace that does not survive between separate shell invocations, so a
     # two-step "download now, parse later" workflow silently loses the captions.
-    errors: list[str] = []
+    errors: dict[str, str] = {}
+    raw_path: Path | None = None
     lang, is_auto = candidates[0]
+
     with tempfile.TemporaryDirectory() as tmp:
-        for index, (lang, is_auto) in enumerate(candidates):
-            raw_path, err = download_captions(args.url, lang, Path(tmp), attempts=attempts)
+        # Two passes over the candidate list, because switching tracks beats retrying
+        # a dead one. Measured: one video's 'en' track returned 429 across five fresh
+        # signatures over four minutes, while its 'ar-orig' answered in the same
+        # second. Pass 1 therefore touches every candidate exactly once with no
+        # backoff, so a working fallback is reached in seconds. Pass 2 adds backoff,
+        # which only helps genuinely transient flakes; it is limited to the leading
+        # candidates so a fully blocked video does not turn into a request storm.
+        passes = ((1, candidates), (retry_attempts, candidates[:MAX_RETRY_PASS_CANDIDATES]))
+        for per_track_attempts, pass_candidates in passes:
+            for index, (cand_lang, cand_auto) in enumerate(pass_candidates):
+                if time.monotonic() >= deadline:
+                    break
+                raw_path, err = download_captions(
+                    args.url,
+                    cand_lang,
+                    Path(tmp),
+                    attempts=per_track_attempts,
+                    deadline=deadline,
+                )
+                if raw_path is not None:
+                    lang, is_auto = cand_lang, cand_auto
+                    if index and not same_language(cand_lang, candidates[0][0]):
+                        # A different language than the one asked for: say so plainly.
+                        # meta.txt records exactly what was substituted (see
+                        # caption_provenance), which matters most on auto-dubbed videos
+                        # where the only real ASR is of the dub.
+                        print(
+                            f"warning: could not fetch {candidates[0][0]!r}; falling back to "
+                            f"the {cand_lang!r} track, which is NOT the video's original "
+                            f"audio language (meta.txt records what it is)",
+                            file=sys.stderr,
+                        )
+                    elif index:
+                        print(
+                            f"warning: {candidates[0][0]!r} was unusable; "
+                            f"used the {cand_lang!r} track instead",
+                            file=sys.stderr,
+                        )
+                    break
+                if err:
+                    errors[cand_lang] = err.splitlines()[-1]
             if raw_path is not None:
-                if index and not same_language(lang, candidates[0][0]):
-                    # A different language than asked for: say so plainly, and note
-                    # that meta.txt records the substitution too.
-                    print(
-                        f"warning: could not fetch {candidates[0][0]!r}; "
-                        f"falling back to the original language {lang!r} "
-                        f"(meta.txt will report the substitution)",
-                        file=sys.stderr,
-                    )
-                elif index:
-                    print(
-                        f"warning: {candidates[0][0]!r} was unusable; "
-                        f"used the {lang!r} track instead",
-                        file=sys.stderr,
-                    )
                 break
-            reason = err.splitlines()[-1] if err else "unknown error"
-            errors.append(f"{lang}: {reason}")
-        else:
+
+        if raw_path is None:
             # Captions exist but none downloaded — almost always throttling. Keep the
             # metadata so the run still yields title/channel/date rather than nothing.
+            tried = [f"{k}: {v}" for k, v in errors.items()]
             summary["caption_language"] = "none"
-            summary["caption_error"] = "; ".join(errors)
+            summary["caption_error"] = "; ".join(tried)
             outdir.mkdir(parents=True, exist_ok=True)
             (outdir / "meta.txt").write_text(
                 "\n".join(f"{k}: {v}" for k, v in summary.items()) + "\n", encoding="utf-8"
             )
             die(
-                "Captions exist but every candidate track failed to download "
-                "(HTTP 429 is the usual cause). Wait a minute and retry, or pass "
-                "--text-lang for a different track.\nTried:\n  "
-                + "\n  ".join(errors)
+                "Captions exist but no candidate track downloaded "
+                "(HTTP 429 is the usual cause). Check whether one video is throttled "
+                "while another fetches fine, then retry once, or pass --lang with a "
+                "track key from --list-langs.\nTried:\n  "
+                + "\n  ".join(tried)
                 + f"\nMetadata written to {outdir}/meta.txt",
                 4,
             )
@@ -476,8 +663,13 @@ def main() -> int:
 
     summary["caption_language"] = lang
     summary["caption_kind"] = "auto-generated" if is_auto else "human-written"
-    if not is_original_track(lang, orig):
-        summary["caption_note"] = f"machine-translated from {orig} by YouTube, not the original wording"
+    # Say what the track actually is. Language codes alone are not enough: a
+    # translation can carry the same code as the audio language (see
+    # caption_provenance), which is how a machine translation once got reported as
+    # the original wording.
+    note = caption_provenance(meta, lang, is_auto, orig)
+    if note:
+        summary["caption_note"] = note
 
     segments = dedupe_rolling(segments)
     if not segments:
